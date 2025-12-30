@@ -16,6 +16,7 @@ import argparse
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import csv
 
 
 def load_images(input_path, reference_path):
@@ -125,6 +126,52 @@ def detect_blue_sheets(img_color):
     return centers, mask, contours
 
 
+def save_detections(input_color, contours, centers, out_dir='detections'):
+    """入力画像に番号付きで注釈を付け、各候補パッチを切り出して保存する。
+    また`detections/detections.csv`を作成する。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    annotated = input_color.copy()
+    rows = []
+    idx = 1
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 200:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        M = cv2.moments(cnt)
+        if M.get('m00', 0) == 0:
+            continue
+        cx = int(M['m10'] / M['m00'])
+        cy = int(M['m01'] / M['m00'])
+
+        # 矩形と番号を描画
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(annotated, str(idx), (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+        # 切り出して保存
+        patch = input_color[y:y + h, x:x + w]
+        patch_path = os.path.join(out_dir, f'patch_{idx:02d}.png')
+        cv2.imwrite(patch_path, patch)
+
+        rows.append({'index': idx, 'bbox_x': x, 'bbox_y': y, 'bbox_w': w, 'bbox_h': h, 'center_x': cx, 'center_y': cy, 'patch': patch_path})
+        idx += 1
+
+    # アノテーション画像を保存
+    annotated_path = os.path.join(out_dir, 'input_annotated.png')
+    cv2.imwrite(annotated_path, annotated)
+
+    # CSVを書き出し
+    csv_path = os.path.join(out_dir, 'detections.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['index', 'bbox_x', 'bbox_y', 'bbox_w', 'bbox_h', 'center_x', 'center_y', 'patch'])
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+    return annotated_path, csv_path, [r['patch'] for r in rows]
+
+
 def transform_points(pts, H):
     """ホモグラフィで入力画像上の点群を参照画像座標系に変換する。"""
     if H is None:
@@ -205,6 +252,14 @@ def main():
     centers, mask, contours = detect_blue_sheets(inp_color)
     transformed_centers = []
     transformed_polygons = []
+
+    # 検出結果を保存（注釈付き画像、切り出しパッチ、CSV）
+    try:
+        ann_path, csv_path, patch_paths = save_detections(inp_color, contours, centers)
+        print(f"注釈画像を保存しました: {ann_path}")
+        print(f"検出一覧CSVを保存しました: {csv_path}")
+    except Exception as e:
+        print(f"検出結果の保存に失敗しました: {e}")
 
     if len(centers) == 0:
         print("入力画像からブルーシートと思われる領域が検出されませんでした。全体マッチにフォールバックします。")
