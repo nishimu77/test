@@ -85,6 +85,14 @@ def match_keypoints_sift(img1_gray, img2_gray, min_matches=10):
     return matches_mask, H, kp1, kp2, good
 
 
+def match_patch_to_reference(patch_gray, ref_gray, min_matches=6):
+    """入力画像から切り出したパッチを参照画像にマッチングするためのラッパ。
+    小さなパッチでは必要マッチ数を減らす。
+    成功すると (matches_mask, H, kp_patch, kp_ref, good_matches) を返す。
+    """
+    return match_keypoints_sift(patch_gray, ref_gray, min_matches=min_matches)
+
+
 def detect_blue_sheets(img_color):
     """HSV閾値で青色領域を抽出し、輪郭の中心座標を返す（ピクセル座標）。"""
     hsv = cv2.cvtColor(img_color, cv2.COLOR_BGR2HSV)
@@ -140,10 +148,24 @@ def pixel_to_latlon(x, y, ref_w, ref_h, tl_lat, tl_lon, br_lat, br_lon):
 def draw_visualization(img_ref_color, transformed_corners, transformed_centers):
     """参照画像上に入力画像の枠と検出点を描画して表示する。"""
     vis = img_ref_color.copy()
-    # 入力画像の枠をポリラインで描画
-    if transformed_corners is not None and len(transformed_corners) == 4:
-        pts = np.int32(transformed_corners).reshape((-1, 1, 2))
-        cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
+    # 入力画像の枠（単一または複数のポリゴン）をポリラインで描画
+    if transformed_corners is not None:
+        # 単一のポリゴン(4点)が来た場合
+        if isinstance(transformed_corners, (list, tuple)) and len(transformed_corners) > 0 and isinstance(transformed_corners[0], (list, tuple)):
+            # もし最初要素が座標タプルなら transformed_corners は単一ポリゴン
+            if len(transformed_corners) == 4 and not any(isinstance(p[0], (list, tuple)) for p in transformed_corners):
+                pts = np.int32(transformed_corners).reshape((-1, 1, 2))
+                cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
+            else:
+                # 複数ポリゴンのとき
+                for poly in transformed_corners:
+                    if poly is None:
+                        continue
+                    try:
+                        pts = np.int32(poly).reshape((-1, 1, 2))
+                        cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
+                    except Exception:
+                        continue
 
     # 検出点を描画
     for (x, y) in transformed_centers:
@@ -178,36 +200,88 @@ def main():
         print(f"画像読み込みエラー: {e}")
         sys.exit(1)
 
-    print("特徴点マッチング（SIFT）を実行しています...")
-    matches_mask, H, kp1, kp2, good = match_keypoints_sift(inp_gray, ref_gray, min_matches=args.min_matches)
-
-    if H is None:
-        print("十分な良好なマッチが得られず、ホモグラフィを推定できませんでした。処理を中止します。")
-        sys.exit(1)
-
-    print("ホモグラフィを推定しました。")
-
-    # ブルーシート検出
+    # まず入力画像からブルーシート領域を検出して、その領域ごとに
+    # 参照画像へ切り出しパッチでマッチングを試みる。
     centers, mask, contours = detect_blue_sheets(inp_color)
+    transformed_centers = []
+    transformed_polygons = []
+
     if len(centers) == 0:
-        print("入力画像からブルーシートと思われる領域が検出されませんでした。")
+        print("入力画像からブルーシートと思われる領域が検出されませんでした。全体マッチにフォールバックします。")
     else:
-        print(f"検出されたブルーシート中心点数: {len(centers)}")
+        print(f"検出されたブルーシート候補数: {len(contours)}。各候補を参照画像にマッチングします...")
+        # 各輪郭についてバウンディングボックスでパッチを切り出してマッチング
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 200:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            # パッチに余裕を持たせるマージン
+            margin = int(max(w, h) * 0.2)
+            x0 = max(0, x - margin)
+            y0 = max(0, y - margin)
+            x1 = min(inp_color.shape[1], x + w + margin)
+            y1 = min(inp_color.shape[0], y + h + margin)
+            patch_color = inp_color[y0:y1, x0:x1]
+            patch_gray = inp_gray[y0:y1, x0:x1]
 
-    # 中心を参照画像座標系に変換
-    try:
-        transformed_centers = transform_points(centers, H) if len(centers) > 0 else []
-    except Exception as e:
-        print(f"点変換エラー: {e}")
-        transformed_centers = []
+            if patch_gray.size == 0:
+                continue
 
-    # 入力画像の4隅を変換して参照画像上の枠を得る
-    h_inp, w_inp = inp_gray.shape
-    corners = [(0, 0), (w_inp - 1, 0), (w_inp - 1, h_inp - 1), (0, h_inp - 1)]
-    try:
-        transformed_corners = transform_points(corners, H)
-    except Exception:
-        transformed_corners = None
+            print(f"候補パッチをマッチング: bbox=({x0},{y0},{x1-x0},{y1-y0})")
+            matches_mask_p, H_p, kp_p, kp_r, good_p = match_patch_to_reference(patch_gray, ref_gray, min_matches=6)
+            if H_p is None:
+                print(" -> この候補は参照画像にマッチしませんでした。")
+                continue
+
+            print(" -> この候補を参照画像にマッチしました。")
+            # 輪郭の中心をpatch座標系に変換して参照座標系へ
+            M = cv2.moments(cnt)
+            if M.get("m00", 0) == 0:
+                continue
+            cx = int(M["m10"] / M["m00"]) - x0
+            cy = int(M["m01"] / M["m00"]) - y0
+            try:
+                tcent = transform_points([(cx, cy)], H_p)[0]
+                transformed_centers.append(tcent)
+            except Exception as e:
+                print(f"候補点の変換に失敗: {e}")
+
+            # パッチの四隅を参照座標系へ変換して可視化用ポリゴンを得る
+            ph, pw = patch_gray.shape
+            p_corners = [(0, 0), (pw - 1, 0), (pw - 1, ph - 1), (0, ph - 1)]
+            try:
+                tpoly = transform_points(p_corners, H_p)
+                transformed_polygons.append(tpoly)
+            except Exception:
+                transformed_polygons.append(None)
+
+    # もしいずれの候補も参照画像上にマッチしなかった場合は、従来通り全体マッチにフォールバック
+    if len(transformed_centers) == 0:
+        print("パッチマッチで位置を特定できませんでした。全体画像での特徴点マッチングを試みます...")
+        matches_mask, H, kp1, kp2, good = match_keypoints_sift(inp_gray, ref_gray, min_matches=args.min_matches)
+        if H is None:
+            print("十分な良好なマッチが得られず、ホモグラフィを推定できませんでした。処理を中止します。")
+            sys.exit(1)
+        print("全体マッチでホモグラフィを推定しました。")
+
+        # 全体ホモグラフィを用いて検出中心を変換
+        try:
+            transformed_centers = transform_points(centers, H) if len(centers) > 0 else []
+        except Exception as e:
+            print(f"点変換エラー: {e}")
+            transformed_centers = []
+
+        # 入力画像の4隅を変換して参照画像上の枠を得る
+        h_inp, w_inp = inp_gray.shape
+        corners = [(0, 0), (w_inp - 1, 0), (w_inp - 1, h_inp - 1), (0, h_inp - 1)]
+        try:
+            transformed_corners = transform_points(corners, H)
+        except Exception:
+            transformed_corners = None
+    else:
+        # パッチマッチで得た複数のポリゴンを可視化用に使う
+        transformed_corners = transformed_polygons
 
     # 参照画像の解像度
     ref_h, ref_w = ref_gray.shape
