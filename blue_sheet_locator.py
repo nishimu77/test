@@ -115,13 +115,10 @@ def match_with_multiscale(img1_gray, img2_gray, min_matches=10, scale_factors=No
         if H is not None and len(good) > best_match_count:
             # スケールを補正したホモグラフィ行列を作成
             if scale != 1.0:
-                # スケール行列: 元の座標をスケール座標に変換
+                # 元画像の点をスケール画像に変換する行列
                 S = np.array([[scale, 0, 0],
                               [0, scale, 0],
                               [0, 0, 1]], dtype=np.float32)
-                S_inv = np.array([[1/scale, 0, 0],
-                                  [0, 1/scale, 0],
-                                  [0, 0, 1]], dtype=np.float32)
                 # H_adjusted = H @ S (元画像座標 -> スケール画像座標 -> ref座標)
                 H_adjusted = H @ S
             else:
@@ -202,6 +199,13 @@ def pixel_to_latlon(x, y, ref_w, ref_h, tl_lat, tl_lon, br_lat, br_lon):
 def draw_visualization(img_ref_color, transformed_corners, transformed_centers):
     """参照画像上に入力画像の枠と検出点を描画して表示する。"""
     vis = img_ref_color.copy()
+    ref_h, ref_w = img_ref_color.shape[:2]
+    
+    print(f"\n[デバッグ] Reference画像サイズ: {ref_w}x{ref_h}")
+    print(f"[デバッグ] 変換された中心点数: {len(transformed_centers)}")
+    if len(transformed_centers) > 0:
+        print(f"[デバッグ] 変換された中心点座標: {transformed_centers}")
+    
     # 入力画像の枠（単一または複数のポリゴン）をポリラインで描画
     if transformed_corners is not None:
         # 単一のポリゴン(4点)が来た場合
@@ -212,13 +216,15 @@ def draw_visualization(img_ref_color, transformed_corners, transformed_centers):
                 cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
             else:
                 # 複数ポリゴンのとき
-                for poly in transformed_corners:
+                for i, poly in enumerate(transformed_corners):
                     if poly is None:
                         continue
                     try:
+                        print(f"[デバッグ] ポリゴン {i}: {poly}")
                         pts = np.int32(poly).reshape((-1, 1, 2))
                         cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
-                    except Exception:
+                    except Exception as e:
+                        print(f"[デバッグ] ポリゴン {i} の描画に失敗: {e}")
                         continue
 
     # 検出点を描画
