@@ -1,0 +1,4 @@
+index,bbox_x,bbox_y,bbox_w,bbox_h,center_x,center_y,patch
+1,240,230,12,39,245,250,detections\patch_01.png
+2,271,149,30,26,285,161,detections\patch_02.png
+3,0,0,691,275,339,116,detections\patch_03.png
