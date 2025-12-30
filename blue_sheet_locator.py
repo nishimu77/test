@@ -43,8 +43,8 @@ def match_keypoints_sift(img1_gray, img2_gray, min_matches=10):
     マッチが不十分なら H は None を返す。
     """
     try:
-        # より多くの特徴点を検出するためパラメータ調整
-        sift = cv2.SIFT_create(nfeatures=0, nOctaveLayers=5, contrastThreshold=0.03, edgeThreshold=15)
+        # より多くの特徴点を検出するためパラメータ調整（さらに強化）
+        sift = cv2.SIFT_create(nfeatures=0, nOctaveLayers=6, contrastThreshold=0.02, edgeThreshold=20, sigma=1.6)
     except Exception:
         # 古いOpenCVでは xfeatures2d にある場合がある
         try:
@@ -65,13 +65,14 @@ def match_keypoints_sift(img1_gray, img2_gray, min_matches=10):
 
     matches = flann.knnMatch(des1, des2, k=2)
 
-    # Loweの比率テストで良いマッチを選別
+    # Loweの比率テストで良いマッチを選別（バランス調整）
     good = []
     for m_n in matches:
         if len(m_n) != 2:
             continue
         m, n = m_n
-        if m.distance < 0.7 * n.distance:
+        # 0.75でバランスを取る（厳しすぎず緩すぎず）
+        if m.distance < 0.75 * n.distance:
             good.append(m)
 
     if len(good) < min_matches:
@@ -196,6 +197,27 @@ def pixel_to_latlon(x, y, ref_w, ref_h, tl_lat, tl_lon, br_lat, br_lon):
     return lat, lon
 
 
+def draw_match_visualization(img1, img2, kp1, kp2, good_matches, H):
+    """マッチング結果を可視化（デバッグ用）。"""
+    # マッチング結果を描画
+    matches_img = cv2.drawMatches(img1, kp1, img2, kp2, good_matches[:50], None,
+                                   flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    
+    # 画像が大きすぎる場合は縮小
+    h, w = matches_img.shape[:2]
+    if w > 1600:
+        scale = 1600 / w
+        matches_img = cv2.resize(matches_img, None, fx=scale, fy=scale)
+    
+    matches_rgb = cv2.cvtColor(matches_img, cv2.COLOR_BGR2RGB)
+    plt.figure(figsize=(16, 8))
+    plt.imshow(matches_rgb)
+    plt.axis('off')
+    plt.title(f'Feature Matches (showing top 50 of {len(good_matches)} matches)')
+    plt.tight_layout()
+    plt.show()
+
+
 def draw_visualization(img_ref_color, transformed_corners, transformed_centers):
     """参照画像上に入力画像の枠と検出点を描画して表示する。"""
     vis = img_ref_color.copy()
@@ -251,6 +273,8 @@ def main():
     parser.add_argument('--br-lon', type=float, required=True, help='Reference画像右下の経度')
     parser.add_argument('--min-matches', type=int, default=10, help='ホモグラフィ推定に必要な最小マッチ数')
     parser.add_argument('--no-show', action='store_true', help='可視化を表示しない')
+    parser.add_argument('--direct-match', action='store_true', default=True, help='ブルーシート検出をスキップして直接全体マッチング（デフォルト有効）')
+    parser.add_argument('--use-blue-detection', action='store_true', help='ブルーシート検出を使用する')
 
     args = parser.parse_args()
 
@@ -260,88 +284,135 @@ def main():
         print(f"画像読み込みエラー: {e}")
         sys.exit(1)
 
-    # まず入力画像からブルーシート領域を検出して、その領域ごとに
-    # 参照画像へ切り出しパッチでマッチングを試みる。
-    centers, mask, contours = detect_blue_sheets(inp_color)
+    # モード選択: 全体マッチング優先 or ブルーシート検出
     transformed_centers = []
-    transformed_polygons = []
-
-    if len(centers) == 0:
-        print("入力画像からブルーシートと思われる領域が検出されませんでした。全体マッチにフォールバックします。")
-    else:
-        print(f"検出されたブルーシート候補数: {len(contours)}。各候補を参照画像にマッチングします...")
-        # 各輪郭についてバウンディングボックスでパッチを切り出してマッチング
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 200:
-                continue
-            x, y, w, h = cv2.boundingRect(cnt)
-            # パッチに余裕を持たせるマージン（周辺の特徴を多く含めるため大きめに取る）
-            margin = int(max(w, h) * 1.5)  # 0.2から1.5に大幅増
-            x0 = max(0, x - margin)
-            y0 = max(0, y - margin)
-            x1 = min(inp_color.shape[1], x + w + margin)
-            y1 = min(inp_color.shape[0], y + h + margin)
-            patch_color = inp_color[y0:y1, x0:x1]
-            patch_gray = inp_gray[y0:y1, x0:x1]
-
-            if patch_gray.size == 0:
-                continue
-
-            print(f"候補パッチをマッチング: bbox=({x0},{y0},{x1-x0},{y1-y0})")
-            matches_mask_p, H_p, kp_p, kp_r, good_p = match_patch_to_reference(patch_gray, ref_gray, min_matches=6)
-            if H_p is None:
-                print(" -> この候補は参照画像にマッチしませんでした。")
-                continue
-
-            print(" -> この候補を参照画像にマッチしました。")
-            # 輪郭の中心をpatch座標系に変換して参照座標系へ
-            M = cv2.moments(cnt)
-            if M.get("m00", 0) == 0:
-                continue
-            cx = int(M["m10"] / M["m00"]) - x0
-            cy = int(M["m01"] / M["m00"]) - y0
-            try:
-                tcent = transform_points([(cx, cy)], H_p)[0]
-                transformed_centers.append(tcent)
-            except Exception as e:
-                print(f"候補点の変換に失敗: {e}")
-
-            # パッチの四隅を参照座標系へ変換して可視化用ポリゴンを得る
-            ph, pw = patch_gray.shape
-            p_corners = [(0, 0), (pw - 1, 0), (pw - 1, ph - 1), (0, ph - 1)]
-            try:
-                tpoly = transform_points(p_corners, H_p)
-                transformed_polygons.append(tpoly)
-            except Exception:
-                transformed_polygons.append(None)
-
-    # もしいずれの候補も参照画像上にマッチしなかった場合は、従来通り全体マッチにフォールバック
-    if len(transformed_centers) == 0:
-        print("パッチマッチで位置を特定できませんでした。全体画像でマルチスケールマッチングを試みます...")
+    transformed_corners = None
+    
+    if args.direct_match and not args.use_blue_detection:
+        print("全体マッチングモード: 入力画像全体をreference.jpgとマッチングします...")
+        # 直接全体マッチング
         matches_mask, H, kp1, kp2, good, scale = match_with_multiscale(inp_gray, ref_gray, min_matches=args.min_matches)
         if H is None:
             print("十分な良好なマッチが得られず、ホモグラフィを推定できませんでした。処理を中止します。")
             sys.exit(1)
-        print(f"全体マッチでホモグラフィを推定しました（スケール: {scale:.2f}）。")
-
-        # 全体ホモグラフィを用いて検出中心を変換
-        try:
-            transformed_centers = transform_points(centers, H) if len(centers) > 0 else []
-        except Exception as e:
-            print(f"点変換エラー: {e}")
-            transformed_centers = []
-
-        # 入力画像の4隅を変換して参照画像上の枠を得る
+        print(f"全体マッチでホモグラフィを推定しました（スケール: {scale:.2f}、マッチ数: {len(good)}）。")
+        
+        # マッチング結果を可視化（デバッグ用）
+        if scale != 1.0:
+            # スケール済み画像を再作成
+            h, w = inp_gray.shape
+            new_w = max(int(w * scale), 20)
+            new_h = max(int(h * scale), 20)
+            inp_scaled = cv2.resize(inp_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            inp_scaled_color = cv2.resize(inp_color, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            inp_scaled_color = inp_color
+        
+        print("\nマッチング結果を表示します（最初のウィンドウ）...")
+        draw_match_visualization(inp_scaled_color, ref_color, kp1, kp2, good, H)
+        
+        # 入力画像の四隅を変換してreference.jpg上の位置を得る
         h_inp, w_inp = inp_gray.shape
         corners = [(0, 0), (w_inp - 1, 0), (w_inp - 1, h_inp - 1), (0, h_inp - 1)]
         try:
             transformed_corners = transform_points(corners, H)
-        except Exception:
+            print(f"入力画像がreference.jpg上でマッチした領域: {transformed_corners}")
+        except Exception as e:
+            print(f"四隅の変換に失敗: {e}")
             transformed_corners = None
+        
+        # 入力画像の中心点を変換（家の位置として）
+        center_x, center_y = w_inp // 2, h_inp // 2
+        try:
+            transformed_centers = transform_points([(center_x, center_y)], H)
+            print(f"入力画像の中心がreference.jpg上の座標: {transformed_centers[0]}")
+        except Exception as e:
+            print(f"中心点の変換に失敗: {e}")
+            transformed_centers = []
+    
     else:
-        # パッチマッチで得た複数のポリゴンを可視化用に使う
-        transformed_corners = transformed_polygons
+        print("ブルーシート検出モード: 青色領域を検出してマッチングします...")
+        # まず入力画像からブルーシート領域を検出して、その領域ごとに
+        # 参照画像へ切り出しパッチでマッチングを試みる。
+        centers, mask, contours = detect_blue_sheets(inp_color)
+        transformed_polygons = []
+
+        if len(centers) == 0:
+            print("入力画像からブルーシートと思われる領域が検出されませんでした。全体マッチにフォールバックします。")
+        else:
+            print(f"検出されたブルーシート候補数: {len(contours)}。各候補を参照画像にマッチングします...")
+            # 各輪郭についてバウンディングボックスでパッチを切り出してマッチング
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < 200:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                # パッチに余裕を持たせるマージン（周辺の特徴を多く含めるため大きめに取る）
+                margin = int(max(w, h) * 1.5)  # 0.2から1.5に大幅増
+                x0 = max(0, x - margin)
+                y0 = max(0, y - margin)
+                x1 = min(inp_color.shape[1], x + w + margin)
+                y1 = min(inp_color.shape[0], y + h + margin)
+                patch_color = inp_color[y0:y1, x0:x1]
+                patch_gray = inp_gray[y0:y1, x0:x1]
+
+                if patch_gray.size == 0:
+                    continue
+
+                print(f"候補パッチをマッチング: bbox=({x0},{y0},{x1-x0},{y1-y0})")
+                matches_mask_p, H_p, kp_p, kp_r, good_p = match_patch_to_reference(patch_gray, ref_gray, min_matches=6)
+                if H_p is None:
+                    print(" -> この候補は参照画像にマッチしませんでした。")
+                    continue
+
+                print(" -> この候補を参照画像にマッチしました。")
+                # 輪郭の中心をpatch座標系に変換して参照座標系へ
+                M = cv2.moments(cnt)
+                if M.get("m00", 0) == 0:
+                    continue
+                cx = int(M["m10"] / M["m00"]) - x0
+                cy = int(M["m01"] / M["m00"]) - y0
+                try:
+                    tcent = transform_points([(cx, cy)], H_p)[0]
+                    transformed_centers.append(tcent)
+                except Exception as e:
+                    print(f"候補点の変換に失敗: {e}")
+
+                # パッチの四隅を参照座標系へ変換して可視化用ポリゴンを得る
+                ph, pw = patch_gray.shape
+                p_corners = [(0, 0), (pw - 1, 0), (pw - 1, ph - 1), (0, ph - 1)]
+                try:
+                    tpoly = transform_points(p_corners, H_p)
+                    transformed_polygons.append(tpoly)
+                except Exception:
+                    transformed_polygons.append(None)
+
+        # もしいずれの候補も参照画像上にマッチしなかった場合は、従来通り全体マッチにフォールバック
+        if len(transformed_centers) == 0:
+            print("パッチマッチで位置を特定できませんでした。全体画像でマルチスケールマッチングを試みます...")
+            matches_mask, H, kp1, kp2, good, scale = match_with_multiscale(inp_gray, ref_gray, min_matches=args.min_matches)
+            if H is None:
+                print("十分な良好なマッチが得られず、ホモグラフィを推定できませんでした。処理を中止します。")
+                sys.exit(1)
+            print(f"全体マッチでホモグラフィを推定しました（スケール: {scale:.2f}）。")
+
+            # 全体ホモグラフィを用いて検出中心を変換
+            try:
+                transformed_centers = transform_points(centers, H) if len(centers) > 0 else []
+            except Exception as e:
+                print(f"点変換エラー: {e}")
+                transformed_centers = []
+
+            # 入力画像の4隅を変換して参照画像上の枠を得る
+            h_inp, w_inp = inp_gray.shape
+            corners = [(0, 0), (w_inp - 1, 0), (w_inp - 1, h_inp - 1), (0, h_inp - 1)]
+            try:
+                transformed_corners = transform_points(corners, H)
+            except Exception:
+                transformed_corners = None
+        else:
+            # パッチマッチで得た複数のポリゴンを可視化用に使う
+            transformed_corners = transformed_polygons
 
     # 参照画像の解像度
     ref_h, ref_w = ref_gray.shape
