@@ -16,7 +16,6 @@ import argparse
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-import csv
 
 
 def load_images(input_path, reference_path):
@@ -44,7 +43,8 @@ def match_keypoints_sift(img1_gray, img2_gray, min_matches=10):
     マッチが不十分なら H は None を返す。
     """
     try:
-        sift = cv2.SIFT_create()
+        # より多くの特徴点を検出するためパラメータ調整
+        sift = cv2.SIFT_create(nfeatures=0, nOctaveLayers=5, contrastThreshold=0.03, edgeThreshold=15)
     except Exception:
         # 古いOpenCVでは xfeatures2d にある場合がある
         try:
@@ -86,12 +86,65 @@ def match_keypoints_sift(img1_gray, img2_gray, min_matches=10):
     return matches_mask, H, kp1, kp2, good
 
 
+def match_with_multiscale(img1_gray, img2_gray, min_matches=10, scale_factors=None):
+    """マルチスケールで画像マッチングを試行する。
+    img1をさまざまなスケールで縮小してimg2とマッチングし、最良の結果を返す。
+    クローズアップ画像と広域画像の間のスケール差に対応するため。
+    
+    Returns:
+        best_result: (matches_mask, H_adjusted, kp1, kp2, good, scale) または (None, None, None, None, [], 1.0)
+    """
+    if scale_factors is None:
+        # デフォルトのスケール係数（1.0から0.05まで、広範囲をカバー）
+        scale_factors = [1.0, 0.8, 0.6, 0.4, 0.3, 0.2, 0.15, 0.1, 0.08, 0.05]
+    
+    best_result = (None, None, None, None, [], 1.0)
+    best_match_count = 0
+    
+    for scale in scale_factors:
+        if scale != 1.0:
+            h, w = img1_gray.shape
+            new_w = max(int(w * scale), 20)
+            new_h = max(int(h * scale), 20)
+            img1_scaled = cv2.resize(img1_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            img1_scaled = img1_gray
+        
+        matches_mask, H, kp1, kp2, good = match_keypoints_sift(img1_scaled, img2_gray, min_matches=min_matches)
+        
+        if H is not None and len(good) > best_match_count:
+            # スケールを補正したホモグラフィ行列を作成
+            if scale != 1.0:
+                # スケール行列: 元の座標をスケール座標に変換
+                S = np.array([[scale, 0, 0],
+                              [0, scale, 0],
+                              [0, 0, 1]], dtype=np.float32)
+                S_inv = np.array([[1/scale, 0, 0],
+                                  [0, 1/scale, 0],
+                                  [0, 0, 1]], dtype=np.float32)
+                # H_adjusted = H @ S (元画像座標 -> スケール画像座標 -> ref座標)
+                H_adjusted = H @ S
+            else:
+                H_adjusted = H
+            
+            best_result = (matches_mask, H_adjusted, kp1, kp2, good, scale)
+            best_match_count = len(good)
+            print(f"  スケール {scale:.2f} で {len(good)} マッチを検出")
+    
+    if best_result[1] is not None:
+        print(f"  → 最良スケール: {best_result[5]:.2f} ({best_match_count} マッチ)")
+    
+    return best_result
+
+
 def match_patch_to_reference(patch_gray, ref_gray, min_matches=6):
     """入力画像から切り出したパッチを参照画像にマッチングするためのラッパ。
-    小さなパッチでは必要マッチ数を減らす。
+    マルチスケールでマッチングを試行する。
     成功すると (matches_mask, H, kp_patch, kp_ref, good_matches) を返す。
     """
-    return match_keypoints_sift(patch_gray, ref_gray, min_matches=min_matches)
+    result = match_with_multiscale(patch_gray, ref_gray, min_matches=min_matches)
+    # scale情報は除いて返す（互換性のため）
+    return result[0], result[1], result[2], result[3], result[4]
 
 
 def detect_blue_sheets(img_color):
@@ -124,52 +177,6 @@ def detect_blue_sheets(img_color):
         centers.append((cx, cy))
 
     return centers, mask, contours
-
-
-def save_detections(input_color, contours, centers, out_dir='detections'):
-    """入力画像に番号付きで注釈を付け、各候補パッチを切り出して保存する。
-    また`detections/detections.csv`を作成する。
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    annotated = input_color.copy()
-    rows = []
-    idx = 1
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 200:
-            continue
-        x, y, w, h = cv2.boundingRect(cnt)
-        M = cv2.moments(cnt)
-        if M.get('m00', 0) == 0:
-            continue
-        cx = int(M['m10'] / M['m00'])
-        cy = int(M['m01'] / M['m00'])
-
-        # 矩形と番号を描画
-        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(annotated, str(idx), (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-        # 切り出して保存
-        patch = input_color[y:y + h, x:x + w]
-        patch_path = os.path.join(out_dir, f'patch_{idx:02d}.png')
-        cv2.imwrite(patch_path, patch)
-
-        rows.append({'index': idx, 'bbox_x': x, 'bbox_y': y, 'bbox_w': w, 'bbox_h': h, 'center_x': cx, 'center_y': cy, 'patch': patch_path})
-        idx += 1
-
-    # アノテーション画像を保存
-    annotated_path = os.path.join(out_dir, 'input_annotated.png')
-    cv2.imwrite(annotated_path, annotated)
-
-    # CSVを書き出し
-    csv_path = os.path.join(out_dir, 'detections.csv')
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['index', 'bbox_x', 'bbox_y', 'bbox_w', 'bbox_h', 'center_x', 'center_y', 'patch'])
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
-    return annotated_path, csv_path, [r['patch'] for r in rows]
 
 
 def transform_points(pts, H):
@@ -253,14 +260,6 @@ def main():
     transformed_centers = []
     transformed_polygons = []
 
-    # 検出結果を保存（注釈付き画像、切り出しパッチ、CSV）
-    try:
-        ann_path, csv_path, patch_paths = save_detections(inp_color, contours, centers)
-        print(f"注釈画像を保存しました: {ann_path}")
-        print(f"検出一覧CSVを保存しました: {csv_path}")
-    except Exception as e:
-        print(f"検出結果の保存に失敗しました: {e}")
-
     if len(centers) == 0:
         print("入力画像からブルーシートと思われる領域が検出されませんでした。全体マッチにフォールバックします。")
     else:
@@ -271,8 +270,8 @@ def main():
             if area < 200:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
-            # パッチに余裕を持たせるマージン
-            margin = int(max(w, h) * 0.2)
+            # パッチに余裕を持たせるマージン（周辺の特徴を多く含めるため大きめに取る）
+            margin = int(max(w, h) * 1.5)  # 0.2から1.5に大幅増
             x0 = max(0, x - margin)
             y0 = max(0, y - margin)
             x1 = min(inp_color.shape[1], x + w + margin)
@@ -313,12 +312,12 @@ def main():
 
     # もしいずれの候補も参照画像上にマッチしなかった場合は、従来通り全体マッチにフォールバック
     if len(transformed_centers) == 0:
-        print("パッチマッチで位置を特定できませんでした。全体画像での特徴点マッチングを試みます...")
-        matches_mask, H, kp1, kp2, good = match_keypoints_sift(inp_gray, ref_gray, min_matches=args.min_matches)
+        print("パッチマッチで位置を特定できませんでした。全体画像でマルチスケールマッチングを試みます...")
+        matches_mask, H, kp1, kp2, good, scale = match_with_multiscale(inp_gray, ref_gray, min_matches=args.min_matches)
         if H is None:
             print("十分な良好なマッチが得られず、ホモグラフィを推定できませんでした。処理を中止します。")
             sys.exit(1)
-        print("全体マッチでホモグラフィを推定しました。")
+        print(f"全体マッチでホモグラフィを推定しました（スケール: {scale:.2f}）。")
 
         # 全体ホモグラフィを用いて検出中心を変換
         try:
