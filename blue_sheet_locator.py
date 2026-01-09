@@ -122,9 +122,8 @@ def main():
     print("　　　　 『3〜4軒ぶんのエリア』を大きく囲ってください！")
     print("　　　　 特徴的な並びパターンを作ることで精度が劇的に上がります。")
     print("=======================================================\n")
-    print ("test")
-    
-    
+    print("testing")
+
     disp_h, disp_w = img_inp.shape[:2]
     scale_disp = 1.0
     if disp_w > 1200:
